@@ -1,0 +1,12 @@
+# Secrets and environment configurations
+.env
+.env.*
+
+# Local dependencies folder (no need to push this; Docker/npm handles it)
+node_modules/
+
+# Local cache or debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.DS_Store

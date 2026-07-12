@@ -66,11 +66,24 @@ async function initActual() {
 app.post('/transaction', async (req, res) => {
   const { transaction, messageId } = req.body; // n8n can pass the email messageId for deduplication
 
-  if (!transaction) {
-    return res.status(400).json({ error: 'No transaction data found in request body' });
+  // Guard Clause: Validate required top-level fields
+  if (!messageId) {
+    console.warn('⚠️ Rejected request: Missing messageId');
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing required field: messageId' 
+    });
   }
 
-  const uniqueId = messageId || `n8n-${Date.now()}`;
+  if (!transaction) {
+    console.warn('⚠️ Rejected request: Missing transaction object');
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Missing required field: transaction' 
+    });
+  }
+
+  const uniqueId = messageId
 
   try {
     // 1. Connect and ensure budget is loaded
@@ -101,7 +114,7 @@ app.post('/transaction', async (req, res) => {
       amount: transaction.amount,
       account: accountId,
       cleared: false,
-      notes: `Milo-ID: ${uniqueId}`
+      notes: `Sync-ID: ${req.body.messageId}`,
     }]);
 
     // 5. Sync updates back to the Unraid instance
