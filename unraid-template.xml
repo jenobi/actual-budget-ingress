@@ -23,7 +23,7 @@
     
     <!-- Environment Variables -->
     <Config Name="Actual Server URL" Target="ACTUAL_SERVER_URL" Default="http://192.168.1.X:5006" Description="The URL of your self-hosted Actual Budget server instance." Type="Variable" Display="always" Required="true" Mask="false"></Config>
-    <Config Name="Actual Server Password" Target="ACTUAL_SERVER_PASSWORD" Default="" Description="The password used to log into your Actual Budget server." Type="Variable" Display="always" Required="true" Mask="true"></Config>
+    <Config Name="Actual Server Password" Target="ACTUAL_PASSWORD" Default="" Description="The password used to log into your Actual Budget server." Type="Variable" Display="always" Required="true" Mask="true"></Config>
     <Config Name="Actual Sync ID" Target="ACTUAL_SYNC_ID" Default="" Description="The unique Budget Sync ID (found under Advanced settings in your Actual Budget file)." Type="Variable" Display="always" Required="true" Mask="false"></Config>
     <Config Name="Default Account Name" Target="DEFAULT_ACCOUNT" Default="ING Direct Debits" Description="The fallback account name in Actual Budget if the incoming account cannot be matched dynamically." Type="Variable" Display="always" Required="false" Mask="false">ING Direct Debits</Config>
   </Configuration>

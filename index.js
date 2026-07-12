@@ -63,10 +63,21 @@ async function initActual() {
   }
 }
 
-app.post('/transaction', async (req, res) => {
-  const { transaction, messageId } = req.body; // n8n can pass the email messageId for deduplication
+// Helper to find the Transfer Payee ID for a given account name
+async function getTransferPayeeId(accountName) {
+  const payees = await Actual.getPayees();
+  // Transfer payees are linked to accounts via 'transfer_acct'
+  const transferPayee = payees.find(p => 
+    p.transfer_acct && 
+    p.name.toLowerCase().includes(accountName.toLowerCase())
+  );
+  return transferPayee ? transferPayee.id : null;
+}
 
-  // Guard Clause: Validate required top-level fields
+app.post('/transaction', async (req, res) => {
+  const { transaction, messageId } = req.body; 
+
+  // 1. Guard Clause: Validate required top-level fields FIRST
   if (!messageId) {
     console.warn('⚠️ Rejected request: Missing messageId');
     return res.status(400).json({ 
@@ -83,16 +94,22 @@ app.post('/transaction', async (req, res) => {
     });
   }
 
-  const uniqueId = messageId
+  const uniqueId = messageId;
 
   try {
-    // 1. Connect and ensure budget is loaded
+    // 2. Connect and ensure budget is loaded
     await initActual();
 
-    // 2. Find the correct account using our dynamic lookup logic
-    const accountId = await resolveAccountId(transaction.targetAccount);
+    const sourceAccountName = transaction.payee;         // "ING Smile"
+    const destinationAccountName = transaction.targetAccount; // "ING Direct Debits"
 
-    // 3. Check for duplicates in a 4-day window (matching your old look-back logic)
+    // Check if the destination is an internal account transfer
+    const transferPayeeId = destinationAccountName ? await getTransferPayeeId(destinationAccountName) : null;
+
+    // Resolve the physical account ledger we are writing this transaction into (the Source)
+    const accountId = await resolveAccountId(sourceAccountName);
+
+    // 5. Check for duplicates in a 4-day window
     const startSearch = new Date(transaction.date);
     startSearch.setDate(startSearch.getDate() - 3);
     const startDate = startSearch.toISOString().split('T')[0];
@@ -107,22 +124,28 @@ app.post('/transaction', async (req, res) => {
       return res.json({ success: true, message: 'Duplicate transaction skipped' });
     }
 
-    // 4. Add the transaction matching your exact parameters
-    await Actual.addTransactions(accountId, [{
+    // 6. Import the transaction using the reconciliation engine to guarantee transfers link
+    console.log('📥 Injecting transaction via import engine...');
+    const importResult = await Actual.importTransactions(accountId, [{
       date: transaction.date,
-      payee_name: transaction.payee,
+      payee: transferPayeeId || null, 
+      payee_name: transferPayeeId ? null : transaction.payee,
       amount: transaction.amount,
       account: accountId,
-      cleared: false,
+      cleared: false, // Explicitly keep individual transaction flag false
       notes: `Sync-ID: ${req.body.messageId}`,
-    }]);
+    }], {
+      defaultCleared: false // Override the import engine's default behavior
+    });
 
-    // 5. Sync updates back to the Unraid instance
+    console.log(`📋 Import engine output: Added ${importResult.added.length}, Updated ${importResult.updated.length}`);
+
+    // 7. Sync updates back to the Unraid instance
     console.log('🔄 Syncing changes back to server...');
     await Actual.sync();
     console.log(`✅ Staged and Synced: ${transaction.payee}`);
 
-    // 6. Graceful close
+    // 8. Graceful close
     await Actual.shutdown();
     return res.json({ success: true, message: 'Transaction synced successfully' });
 
