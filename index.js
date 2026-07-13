@@ -83,7 +83,6 @@ app.post('/transaction', async (req, res) => {
   // Enforce API key check if configured
   if (INGRESS_API_KEY) {
     const inboundKey = req.headers['x-api-key'];
-    
     if (!inboundKey || inboundKey !== INGRESS_API_KEY) {
       console.log(`🔒 Blocked unauthorized request. Provided key: ${inboundKey ? 'invalid' : 'none'}`);
       return res.status(401).json({ error: 'Unauthorized: Invalid or missing X-Api-Key' });
@@ -92,99 +91,120 @@ app.post('/transaction', async (req, res) => {
   
   const { transaction, messageId } = req.body; 
 
-  // 1. Guard Clause: Validate required top-level fields FIRST
-  if (!messageId) {
-    console.warn('⚠️ Rejected request: Missing messageId');
+  // 1. Guard Clause: Validate required top-level fields
+  if (!messageId || !transaction) {
+    console.warn('⚠️ Rejected request: Missing messageId or transaction object');
     return res.status(400).json({ 
       success: false, 
-      error: 'Missing required field: messageId' 
+      error: 'Missing required fields: messageId and transaction are mandatory.' 
     });
   }
-
-  if (!transaction) {
-    console.warn('⚠️ Rejected request: Missing transaction object');
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Missing required field: transaction' 
-    });
-  }
-
-  const uniqueId = messageId;
 
   try {
     // 2. Connect and ensure budget is loaded
     await initActual();
 
-    const isMissingPayee = transaction.payee === null;
-    const sourceAccountName = transaction.payee;              // e.g., "MS BERNADETTE MARIE GRACEY" or "Smile"
-    const destinationAccountName = transaction.targetAccount;  // e.g., "Direct Debits"
+    // Resolve the physical ledger account we are writing into (the Destination account)
+    const accountId = await resolveAccountId(transaction.targetAccount);
 
-    // Fetch master payee records to see if the source string matches a system transfer account
-    const payeesList = await Actual.getPayees();
-    const isInternalSource = sourceAccountName && payeesList.some(p => 
-      p.transfer_acct && p.name.toLowerCase().includes(sourceAccountName.toLowerCase())
-    );
-
-    // FIX 1: Only look up transfer mappings if the transaction payee string represents an internal account
-    const transferPayeeId = (isInternalSource && !isMissingPayee) 
-      ? await getTransferPayeeId(sourceAccountName) 
-      : null;
-
-    // Resolve the physical account ledger we are writing this transaction into (the Destination)
-    const accountId = await resolveAccountId(destinationAccountName);
-
-    // FIX 2 (Deep Circular Guard): Validate that the resolved source account mapping doesn't match the resolved destination ledger
-    const systemAccounts = await Actual.getAccounts();
-    const resolvedLedger = systemAccounts.find(a => a.id === accountId);
-    
-    if (resolvedLedger && isInternalSource) {
-      const resolvedTransferPayee = payeesList.find(p => p.id === transferPayeeId);
-      if (resolvedTransferPayee && resolvedTransferPayee.transfer_acct === resolvedLedger.id) {
-        console.warn(`⚠️ Rejected request: Circular reference detected. Resolved source account matches resolved destination ledger ("${resolvedLedger.name}")`);
-        await Actual.shutdown();
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid transaction: Source account and destination ledger cannot be the same.'
-        });
-      }
-    }
-
-    // 5. Check for duplicates in a 4-day window
+    // 3. Check for duplicates in a 4-day window to prevent n8n retry double-posting
     const startSearch = new Date(transaction.date);
     startSearch.setDate(startSearch.getDate() - 3);
     const startDate = startSearch.toISOString().split('T')[0];
     const endDate = new Date().toISOString().split('T')[0];
 
     const accountTxns = await Actual.getTransactions(accountId, startDate, endDate);
-    const alreadyProcessed = accountTxns.some(tx => tx.notes && tx.notes.includes(uniqueId));
+    const alreadyProcessed = accountTxns.some(tx => tx.notes && tx.notes.includes(messageId));
 
     if (alreadyProcessed) {
-      console.log(`⏭️ Skipping: ${uniqueId} already exists in Actual.`);
+      console.log(`⏭️ Skipping: Sync-ID ${messageId} already exists in Actual.`);
       await Actual.shutdown();
       return res.json({ success: true, message: 'Duplicate transaction skipped' });
     }
 
-    // 6. Import the transaction using the reconciliation engine
-    console.log('📥 Injecting transaction via import engine...');
-    const importResult = await Actual.importTransactions(accountId, [{
-      date: transaction.date,
-      payee: transferPayeeId || null, 
-      payee_name: (transferPayeeId || isMissingPayee) ? null : transaction.payee,
-      amount: transaction.amount,
-      account: accountId,
-      cleared: false, 
-      notes: `Sync-ID: ${req.body.messageId}`,
-      imported_id: `${uniqueId}`,
-    }], {
-      defaultCleared: false 
-    });
+    // 4. Check type and prepare the insertion array
+    const transactionsToInsert = [];
 
-    console.log(`📋 Import engine output: Added ${importResult.added.length}, Updated ${importResult.updated.length}`);
+    if (transaction.type === 'internal_transfer') {
+      console.log(`🔀 Processing as an internal transfer from "${transaction.payee}" to "${transaction.targetAccount}"`);
+      
+      // Resolve account UUIDs for both sides
+      const sourceAccountId = await resolveAccountId(transaction.payee);
+      const destinationAccountId = await resolveAccountId(transaction.targetAccount);
+      
+      // Fetch system payees list
+      const payeesList = await Actual.getPayees();
+      
+      // Find the transfer payees that point to each account
+      const sourceTransferPayee = payeesList.find(p => p.transfer_acct === sourceAccountId);
+      const destinationTransferPayee = payeesList.find(p => p.transfer_acct === destinationAccountId);
 
-    // 7. Sync updates back to the instance
+      if (!sourceTransferPayee || !destinationTransferPayee) {
+        throw new Error(`Missing system transfer payees. Source found: ${!!sourceTransferPayee}, Dest found: ${!!destinationTransferPayee}`);
+      }
+
+      // Generate two unique database IDs for the twin transactions locally
+      const idA = crypto.randomUUID();
+      const idB = crypto.randomUUID();
+
+      // Leg A: The Destination Account (Inflow / Positive)
+      transactionsToInsert.push({
+        id: idA,
+        transfer_id: idB,
+        date: transaction.date,
+        amount: transaction.amount,
+        account: destinationAccountId,
+        payee: sourceTransferPayee.id,
+        cleared: false,
+        notes: `Sync-ID: ${messageId}`
+      });
+
+      // Leg B: The Source Account (Outflow / Negative)
+      transactionsToInsert.push({
+        id: idB,
+        transfer_id: idA,
+        date: transaction.date,
+        amount: -transaction.amount, // Negative inversion for outflow
+        account: sourceAccountId,
+        payee: destinationTransferPayee.id,
+        cleared: false,
+        notes: `Sync-ID: ${messageId}`
+      });
+
+    } else {
+      console.log(`💰 Processing as a standard transaction payload for payee: "${transaction.payee}"`);
+      
+      // For standard transactions, we insert a single payload into the destination ledger
+      transactionsToInsert.push({
+        date: transaction.date,
+        amount: transaction.amount,
+        account: accountId,
+        payee_name: transaction.payee || null,
+        payee: null,
+        cleared: false,
+        notes: `Sync-ID: ${messageId}`
+      });
+    }
+
+    // 5. Inject the transaction(s) into their correct ledger(s)
+    if (transaction.type === 'internal_transfer') {
+      console.log(`📥 Injecting transfer legs: Leg A into Destination, Leg B into Source...`);
+      
+      // Pull out the individual legs from the array we built
+      const [legA, legB] = transactionsToInsert;
+
+      // Insert Leg A into the Destination Account, and Leg B into the Source Account
+      await Actual.addTransactions(legA.account, [legA]);
+      await Actual.addTransactions(legB.account, [legB]);
+    } else {
+      console.log(`📥 Injecting standard transaction via addTransactions...`);
+      await Actual.addTransactions(accountId, transactionsToInsert);
+    }
+
+    // 7. Sync updates back to the server instance
     console.log('🔄 Syncing changes back to server...');
     await Actual.sync();
-    console.log(`✅ Staged and Synced: ${transaction.payee}`);
+    console.log(`✅ Staged and Synced successfully.`);
 
     // 8. Graceful close
     await Actual.shutdown();
