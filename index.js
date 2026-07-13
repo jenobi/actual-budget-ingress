@@ -17,6 +17,12 @@ const ACTUAL_SERVER_URL = (process.env.ACTUAL_SERVER_URL || '').trim();
 const ACTUAL_PASSWORD = (process.env.ACTUAL_PASSWORD || '').trim();
 const SYNC_ID = (process.env.ACTUAL_SYNC_ID || '').trim();
 const DEFAULT_ACCOUNT = process.env.DEFAULT_ACCOUNT || 'ING Direct Debits';
+const INGRESS_API_KEY = process.env.INGRESS_API_KEY || '';
+
+// Quick check to warn you if you forgot to set it in production
+if (process.env.NODE_ENV === 'production' && !INGRESS_API_KEY) {
+  console.warn('⚠️ WARNING: INGRESS_API_KEY is not set in production. The bridge is running completely open!');
+}
 
 // Helper function to resolve account UUID dynamically based on your old script's rules
 async function resolveAccountId(friendlyName) {
@@ -75,6 +81,17 @@ async function getTransferPayeeId(accountName) {
 }
 
 app.post('/transaction', async (req, res) => {
+
+  // Enforce API key check if configured
+  if (INGRESS_API_KEY) {
+    const inboundKey = req.headers['x-api-key'];
+    
+    if (!inboundKey || inboundKey !== INGRESS_API_KEY) {
+      console.log(`🔒 Blocked unauthorized request. Provided key: ${inboundKey ? 'invalid' : 'none'}`);
+      return res.status(401).json({ error: 'Unauthorized: Invalid or missing X-Api-Key' });
+    }
+  }
+  
   const { transaction, messageId } = req.body; 
 
   // 1. Guard Clause: Validate required top-level fields FIRST
