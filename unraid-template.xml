@@ -18,11 +18,12 @@
   <Date>2026-07-12</Date>
   <MinVer></MinVer>
   <!-- Port Configuration -->
-  <Config Name="Container Port" Target="3000" Default="3000" Mode="tcp" Description="The internal port the Express server listens on." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
+  <Config Name="Container Port" Target="3000" Default="3000" Mode="tcp" Description="The internal port the Express server listens on." Type="Port" Display="always" Required="true" Mask="false"></Config>
   <Config Name="Ingress API Key" Target="INGRESS_API_KEY" Default="" Description="The secret key required in the X-Api-Key header to authorize n8n requests." Type="Variable" Display="always" Required="true" Mask="true"></Config>
   <!-- Environment Variables -->
   <Config Name="Actual Server URL" Target="ACTUAL_SERVER_URL" Default="http://192.168.1.X:5006" Description="The URL of your self-hosted Actual Budget server instance." Type="Variable" Display="always" Required="true" Mask="false"></Config>
   <Config Name="Actual Server Password" Target="ACTUAL_PASSWORD" Default="" Description="The password used to log into your Actual Budget server." Type="Variable" Display="always" Required="true" Mask="true"></Config>
   <Config Name="Actual Sync ID" Target="ACTUAL_SYNC_ID" Default="" Description="The unique Budget Sync ID (found under Advanced settings in your Actual Budget file)." Type="Variable" Display="always" Required="true" Mask="false"></Config>
-  <Config Name="Default Account Name" Target="DEFAULT_ACCOUNT" Default="ING Direct Debits" Description="The fallback account name in Actual Budget if the incoming account cannot be matched dynamically." Type="Variable" Display="always" Required="false" Mask="false">ING Direct Debits</Config>
+  <Config Name="Default Account Name" Target="DEFAULT_ACCOUNT" Default="ING Direct Debits" Description="The fallback account name in Actual Budget if the incoming account cannot be matched dynamically." Type="Variable" Display="always" Required="false" Mask="false"></Config>
+  <Config Name="Logging Level" Target="LOG_LEVEL" Default="Warn" Description="Sets the logging level of the server, 'debug','info','warn','error'" Type="Variable" Display="always" Required="false" Mask="false"></Config>
 </Container>

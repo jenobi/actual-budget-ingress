@@ -2,52 +2,84 @@ const express = require('express');
 const Actual = require('@actual-app/api');
 const path = require('path');
 const fs = require('fs').promises;
+const crypto = require('crypto');
 
-// Intercept the known Actual API package bug to keep the Express server from crashing
+// 1. Hierarchical Logger Setup
+const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+const LOG_LEVEL = (process.env.LOG_LEVEL || 'info').toLowerCase().trim();
+const CURRENT_WEIGHT = LEVELS[LOG_LEVEL] !== undefined ? LEVELS[LOG_LEVEL] : 1;
+
+const logger = {
+  debug: (...args) => { if (CURRENT_WEIGHT <= 0) console.log('🔍 [DEBUG]', ...args); },
+  info:  (...args) => { if (CURRENT_WEIGHT <= 1) console.log('ℹ️ [INFO]',  ...args); },
+  warn:  (...args) => { if (CURRENT_WEIGHT <= 2) console.warn('⚠️ [WARN]',  ...args); },
+  error: (...args) => { if (CURRENT_WEIGHT <= 3) console.error('❌ [ERROR]', ...args); }
+};
+
+// Intercept known Actual API package unhandled rejections to prevent Express crashes
 process.on('unhandledRejection', (reason, promise) => {
-  console.warn('⚠️ Intercepted an unhandled promise rejection (Actual API bug):', reason);
+  logger.warn('Intercepted an unhandled promise rejection (Actual API package limitation):', reason);
 });
 
 const app = express();
 app.use(express.json());
 
+// 2. Configuration Parameters via Environment Variables
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = '/tmp/actual-api-data';
+const DATA_DIR = process.env.ACTUAL_DATA_DIR || '/tmp/actual-api-data';
 const ACTUAL_SERVER_URL = (process.env.ACTUAL_SERVER_URL || '').trim();
 const ACTUAL_PASSWORD = (process.env.ACTUAL_PASSWORD || '').trim();
 const SYNC_ID = (process.env.ACTUAL_SYNC_ID || '').trim();
-const DEFAULT_ACCOUNT = process.env.DEFAULT_ACCOUNT || 'ING Direct Debits';
+const DEFAULT_ACCOUNT = process.env.DEFAULT_ACCOUNT || '';
 const INGRESS_API_KEY = process.env.INGRESS_API_KEY || '';
 
 if (process.env.NODE_ENV === 'production' && !INGRESS_API_KEY) {
-  console.warn('⚠️ WARNING: INGRESS_API_KEY is not set in production. The bridge is running completely open!');
+  logger.warn('INGRESS_API_KEY is not set in production environment. The bridge gateway is open!');
 }
 
-// Helper function to resolve account UUID dynamically
+/**
+ * Dynamically resolves an account friendly name to its unique system UUID
+ */
 async function resolveAccountId(friendlyName) {
   const accounts = await Actual.getAccounts();
   const searchName = friendlyName ? friendlyName.toLowerCase().trim() : '';
 
-  // 1. Try exact match
-  let account = accounts.find(a => a.name.toLowerCase() === searchName);
-  
-  // 2. Try prefix fallback match if exact failed
-  if (!account && searchName) {
-    account = accounts.find(a => a.name.toLowerCase() === `ing ${searchName}`);
+  if (!searchName) {
+    if (DEFAULT_ACCOUNT) {
+      logger.debug(`Empty account name provided. Falling back to configured default account.`);
+      const defaultAcc = accounts.find(a => a.name.toLowerCase() === DEFAULT_ACCOUNT.toLowerCase());
+      if (defaultAcc) return defaultAcc.id;
+    }
+    throw new Error('Could not resolve account: No name provided and no valid default fallback exists.');
   }
 
-  // 3. Fallback to default account if nothing matched
+  // 1. First Pass: Look for a clean exact match
+  let account = accounts.find(a => a.name.toLowerCase() === searchName);
+  
+  // 2. Second Pass: If no exact match, try a fuzzy partial match (.includes)
   if (!account) {
+    account = accounts.find(a => a.name.toLowerCase().includes(searchName));
+    if (account) {
+      logger.debug(`Fuzzy match found: Mapping "${friendlyName}" to system account "${account.name}"`);
+    }
+  }
+
+  // 3. Final Pass: Drop back to configured default account if both passes failed
+  if (!account && DEFAULT_ACCOUNT) {
+    logger.warn(`No exact or fuzzy match for "${friendlyName}". Defaulting to: ${DEFAULT_ACCOUNT}`);
     account = accounts.find(a => a.name.toLowerCase() === DEFAULT_ACCOUNT.toLowerCase());
   }
 
   if (!account) {
-    throw new Error(`Could not find account matching "${friendlyName}" or default "${DEFAULT_ACCOUNT}"`);
+    throw new Error(`Could not resolve account matching "${friendlyName}" across exact, fuzzy, or default profiles.`);
   }
 
   return account.id;
 }
 
+/**
+ * Structural setup and sync initialization for the local budget instance
+ */
 async function initActual() {
   await fs.mkdir(DATA_DIR, { recursive: true });
   await Actual.init({
@@ -60,143 +92,150 @@ async function initActual() {
   const existing = budgets.find(b => b.id === SYNC_ID);
 
   if (!existing) {
-    console.log('📥 Budget not found locally. Downloading...');
+    logger.info('Budget file not found locally. Downloading from server...');
     await Actual.downloadBudget(SYNC_ID);
   } else {
-    console.log(`📂 Loading local budget: ${existing.id}`);
+    logger.debug(`Loading local cached budget copy: ${existing.id}`);
     await Actual.loadBudget(existing.id);
   }
 }
 
-// Helper to find the Transfer Payee ID for a given account name
-async function getTransferPayeeId(accountName) {
-  const payees = await Actual.getPayees();
-  const transferPayee = payees.find(p => 
-    p.transfer_acct && 
-    p.name.toLowerCase().includes(accountName.toLowerCase())
-  );
-  return transferPayee ? transferPayee.id : null;
-}
-
+// 3. Central Ingress Endpoints
 app.post('/transaction', async (req, res) => {
 
-  // Enforce API key check if configured
+  // Enforce API key restriction header verification if configured
   if (INGRESS_API_KEY) {
     const inboundKey = req.headers['x-api-key'];
-    
     if (!inboundKey || inboundKey !== INGRESS_API_KEY) {
-      console.log(`🔒 Blocked unauthorized request. Provided key: ${inboundKey ? 'invalid' : 'none'}`);
-      return res.status(401).json({ error: 'Unauthorized: Invalid or missing X-Api-Key' });
+      logger.warn(`Blocked unauthorized request attempt.`);
+      return res.status(401).json({ error: 'Unauthorized: Invalid or missing X-Api-Key configuration' });
     }
   }
   
   const { transaction, messageId } = req.body; 
 
-  // 1. Guard Clause: Validate required top-level fields FIRST
-  if (!messageId) {
-    console.warn('⚠️ Rejected request: Missing messageId');
+  // Basic Guardrails: Enforce top-level payload structure integrity
+  if (!messageId || !transaction) {
+    logger.warn('Rejected request matching bad payload topology: Missing messageId or transaction block');
     return res.status(400).json({ 
       success: false, 
-      error: 'Missing required field: messageId' 
+      error: 'Missing required fields: messageId and transaction objects are mandatory.' 
     });
   }
-
-  if (!transaction) {
-    console.warn('⚠️ Rejected request: Missing transaction object');
-    return res.status(400).json({ 
-      success: false, 
-      error: 'Missing required field: transaction' 
-    });
-  }
-
-  const uniqueId = messageId;
 
   try {
-    // 2. Connect and ensure budget is loaded
     await initActual();
 
-    const isMissingPayee = transaction.payee === null;
-    const sourceAccountName = transaction.payee;              // e.g., "MS BERNADETTE MARIE GRACEY" or "Smile"
-    const destinationAccountName = transaction.targetAccount;  // e.g., "Direct Debits"
+    // Resolve target ledger account UUID
+    const accountId = await resolveAccountId(transaction.targetAccount);
 
-    // Fetch master payee records to see if the source string matches a system transfer account
-    const payeesList = await Actual.getPayees();
-    const isInternalSource = sourceAccountName && payeesList.some(p => 
-      p.transfer_acct && p.name.toLowerCase().includes(sourceAccountName.toLowerCase())
-    );
-
-    // FIX 1: Only look up transfer mappings if the transaction payee string represents an internal account
-    const transferPayeeId = (isInternalSource && !isMissingPayee) 
-      ? await getTransferPayeeId(sourceAccountName) 
-      : null;
-
-    // Resolve the physical account ledger we are writing this transaction into (the Destination)
-    const accountId = await resolveAccountId(destinationAccountName);
-
-    // FIX 2 (Deep Circular Guard): Validate that the resolved source account mapping doesn't match the resolved destination ledger
-    const systemAccounts = await Actual.getAccounts();
-    const resolvedLedger = systemAccounts.find(a => a.id === accountId);
-    
-    if (resolvedLedger && isInternalSource) {
-      const resolvedTransferPayee = payeesList.find(p => p.id === transferPayeeId);
-      if (resolvedTransferPayee && resolvedTransferPayee.transfer_acct === resolvedLedger.id) {
-        console.warn(`⚠️ Rejected request: Circular reference detected. Resolved source account matches resolved destination ledger ("${resolvedLedger.name}")`);
-        await Actual.shutdown();
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid transaction: Source account and destination ledger cannot be the same.'
-        });
-      }
-    }
-
-    // 5. Check for duplicates in a 4-day window
+    // Duplicate Check Window: Scan recent records to catch network/retry double-posting
     const startSearch = new Date(transaction.date);
     startSearch.setDate(startSearch.getDate() - 3);
     const startDate = startSearch.toISOString().split('T')[0];
     const endDate = new Date().toISOString().split('T')[0];
 
     const accountTxns = await Actual.getTransactions(accountId, startDate, endDate);
-    const alreadyProcessed = accountTxns.some(tx => tx.notes && tx.notes.includes(uniqueId));
+    logger.debug(`Duplicate check scanned window [${startDate} to ${endDate}] and found ${accountTxns.length} recent transactions.`);
+    const alreadyProcessed = accountTxns.some(tx => tx.notes && tx.notes.includes(messageId));
 
     if (alreadyProcessed) {
-      console.log(`⏭️ Skipping: ${uniqueId} already exists in Actual.`);
+      logger.info(`Skipping duplicate request tracking Sync-ID: ${messageId}`);
       await Actual.shutdown();
-      return res.json({ success: true, message: 'Duplicate transaction skipped' });
+      return res.json({ success: true, message: 'Duplicate transaction injection skipped' });
     }
 
-    // 6. Import the transaction using the reconciliation engine
-    console.log('📥 Injecting transaction via import engine...');
-    const importResult = await Actual.importTransactions(accountId, [{
-      date: transaction.date,
-      payee: transferPayeeId || null, 
-      payee_name: (transferPayeeId || isMissingPayee) ? null : transaction.payee,
-      amount: transaction.amount,
-      account: accountId,
-      cleared: false, 
-      notes: `Sync-ID: ${req.body.messageId}`,
-      imported_id: `${uniqueId}`,
-    }], {
-      defaultCleared: false 
-    });
+    const transactionsToInsert = [];
 
-    console.log(`📋 Import engine output: Added ${importResult.added.length}, Updated ${importResult.updated.length}`);
+    // Branching Processing Topology based on execution metadata type
+    if (transaction.type === 'internal_transfer') {
+      logger.info(`Processing linked double-entry transfer from "${transaction.payee}" to "${transaction.targetAccount}"`);
+      
+      const sourceAccountId = await resolveAccountId(transaction.payee);
+      const destinationAccountId = accountId;
+      
+      // 🚨 CRITICAL GUARD: Prevent circular loop transfer failure
+      if (sourceAccountId === destinationAccountId) {
+        throw new Error(`Transfer aborted: Source and Destination accounts both resolved to the same ledger ID (${sourceAccountId}). Verify payload names or default fallbacks.`);
+      }
 
-    // 7. Sync updates back to the instance
-    console.log('🔄 Syncing changes back to server...');
+      logger.debug(`Resolved transfer accounts -> Source UUID: ${sourceAccountId} | Destination UUID: ${destinationAccountId}`);
+      
+      const payeesList = await Actual.getPayees();
+      const sourceTransferPayee = payeesList.find(p => p.transfer_acct === sourceAccountId);
+      const destinationTransferPayee = payeesList.find(p => p.transfer_acct === destinationAccountId);
+
+      if (!sourceTransferPayee || !destinationTransferPayee) {
+        throw new Error('Failed structural integrity check: Missing corresponding system-managed transfer payees.');
+      }
+
+      logger.debug(`Resolved system transfer payees -> Source Payee ID: ${sourceTransferPayee.id} | Destination Payee ID: ${destinationTransferPayee.id}`);
+
+      // Generate local matching keys to structurally bind the double-entry legs together
+      const idA = crypto.randomUUID();
+      const idB = crypto.randomUUID();
+
+      // Leg A: Destination Account ledger write layer (Inflow/Positive)
+      transactionsToInsert.push({
+        id: idA,
+        transfer_id: idB,
+        date: transaction.date,
+        amount: transaction.amount,
+        account: destinationAccountId,
+        payee: sourceTransferPayee.id,
+        cleared: false,
+        notes: `Sync-ID: ${messageId}`
+      });
+
+      // Leg B: Source Account ledger write layer (Outflow/Inverted Negative)
+      transactionsToInsert.push({
+        id: idB,
+        transfer_id: idA,
+        date: transaction.date,
+        amount: -transaction.amount,
+        account: sourceAccountId,
+        payee: destinationTransferPayee.id,
+        cleared: false,
+        notes: `Sync-ID: ${messageId}`
+      });
+
+      logger.debug(`Injecting explicit transfer pairs via addTransactions engine. Payloads:`, JSON.stringify(transactionsToInsert, null, 2));
+      const [legA, legB] = transactionsToInsert;
+      await Actual.addTransactions(legA.account, [legA]);
+      await Actual.addTransactions(legB.account, [legB]);
+
+    } else {
+      logger.info(`Processing standard transaction record entry for payee: "${transaction.payee}"`);
+      
+      const standardPayload = {
+        date: transaction.date,
+        amount: transaction.amount,
+        account: accountId,
+        payee_name: transaction.payee || null,
+        payee: null,
+        cleared: false,
+        notes: `Sync-ID: ${messageId}`
+      };
+
+      logger.debug(`Injecting standard single entry via addTransactions engine. Payload:`, JSON.stringify(standardPayload, null, 2));
+      await Actual.addTransactions(accountId, [standardPayload]);
+    }
+
+    logger.debug('Synchronizing data delta changes to remote instance...');
     await Actual.sync();
-    console.log(`✅ Staged and Synced: ${transaction.payee}`);
+    logger.info(`Successfully staged and synchronized transaction metrics.`);
 
-    // 8. Graceful close
     await Actual.shutdown();
-    return res.json({ success: true, message: 'Transaction synced successfully' });
+    return res.json({ success: true, message: 'Transaction datasets processed and synced safely' });
 
   } catch (error) {
-    console.error('❌ Error handling transaction webhook:', error);
+    logger.error('Failure intercepted inside endpoint execution runtime:', error);
     try { await Actual.shutdown(); } catch (_) {}
     return res.status(500).json({ error: error.message });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Actual Budget bridge listening on port ${PORT}`);
+  logger.info(`Active configured logging filtering threshold: ${LOG_LEVEL}`);
+  logger.info(`Actual Budget integration engine gateway operating on port ${PORT}`);
 });
