@@ -32,6 +32,7 @@ const ACTUAL_PASSWORD = (process.env.ACTUAL_PASSWORD || '').trim();
 const SYNC_ID = (process.env.ACTUAL_SYNC_ID || '').trim();
 const DEFAULT_ACCOUNT = process.env.DEFAULT_ACCOUNT || '';
 const INGRESS_API_KEY = process.env.INGRESS_API_KEY || '';
+const TRANSACTION_NOTE = process.env.TRANSACTION_NOTE || '🤖 Automated Entry'
 
 if (process.env.NODE_ENV === 'production' && !INGRESS_API_KEY) {
   logger.warn('INGRESS_API_KEY is not set in production environment. The bridge gateway is open!');
@@ -151,7 +152,7 @@ app.post('/transaction', async (req, res) => {
     }
 
     const transactionsToInsert = [];
-    const automationNote = '🤖 Automated Entry';
+    const automationNote = TRANSACTION_NOTE;
 
     // Branching Processing Topology based on execution metadata type
     if (transaction.type === 'internal_transfer') {
