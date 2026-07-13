@@ -19,12 +19,11 @@ const SYNC_ID = (process.env.ACTUAL_SYNC_ID || '').trim();
 const DEFAULT_ACCOUNT = process.env.DEFAULT_ACCOUNT || 'ING Direct Debits';
 const INGRESS_API_KEY = process.env.INGRESS_API_KEY || '';
 
-// Quick check to warn you if you forgot to set it in production
 if (process.env.NODE_ENV === 'production' && !INGRESS_API_KEY) {
   console.warn('⚠️ WARNING: INGRESS_API_KEY is not set in production. The bridge is running completely open!');
 }
 
-// Helper function to resolve account UUID dynamically based on your old script's rules
+// Helper function to resolve account UUID dynamically
 async function resolveAccountId(friendlyName) {
   const accounts = await Actual.getAccounts();
   const searchName = friendlyName ? friendlyName.toLowerCase().trim() : '';
@@ -72,7 +71,6 @@ async function initActual() {
 // Helper to find the Transfer Payee ID for a given account name
 async function getTransferPayeeId(accountName) {
   const payees = await Actual.getPayees();
-  // Transfer payees are linked to accounts via 'transfer_acct'
   const transferPayee = payees.find(p => 
     p.transfer_acct && 
     p.name.toLowerCase().includes(accountName.toLowerCase())
@@ -117,14 +115,39 @@ app.post('/transaction', async (req, res) => {
     // 2. Connect and ensure budget is loaded
     await initActual();
 
-    const sourceAccountName = transaction.payee;         // "ING Smile"
-    const destinationAccountName = transaction.targetAccount; // "ING Direct Debits"
+    const isMissingPayee = transaction.payee === null;
+    const sourceAccountName = transaction.payee;              // e.g., "MS BERNADETTE MARIE GRACEY" or "Smile"
+    const destinationAccountName = transaction.targetAccount;  // e.g., "Direct Debits"
 
-    // Check if the destination is an internal account transfer
-    const transferPayeeId = destinationAccountName ? await getTransferPayeeId(destinationAccountName) : null;
+    // Fetch master payee records to see if the source string matches a system transfer account
+    const payeesList = await Actual.getPayees();
+    const isInternalSource = sourceAccountName && payeesList.some(p => 
+      p.transfer_acct && p.name.toLowerCase().includes(sourceAccountName.toLowerCase())
+    );
 
-    // Resolve the physical account ledger we are writing this transaction into (the Source)
-    const accountId = await resolveAccountId(sourceAccountName);
+    // FIX 1: Only look up transfer mappings if the transaction payee string represents an internal account
+    const transferPayeeId = (isInternalSource && !isMissingPayee) 
+      ? await getTransferPayeeId(sourceAccountName) 
+      : null;
+
+    // Resolve the physical account ledger we are writing this transaction into (the Destination)
+    const accountId = await resolveAccountId(destinationAccountName);
+
+    // FIX 2 (Deep Circular Guard): Validate that the resolved source account mapping doesn't match the resolved destination ledger
+    const systemAccounts = await Actual.getAccounts();
+    const resolvedLedger = systemAccounts.find(a => a.id === accountId);
+    
+    if (resolvedLedger && isInternalSource) {
+      const resolvedTransferPayee = payeesList.find(p => p.id === transferPayeeId);
+      if (resolvedTransferPayee && resolvedTransferPayee.transfer_acct === resolvedLedger.id) {
+        console.warn(`⚠️ Rejected request: Circular reference detected. Resolved source account matches resolved destination ledger ("${resolvedLedger.name}")`);
+        await Actual.shutdown();
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid transaction: Source account and destination ledger cannot be the same.'
+        });
+      }
+    }
 
     // 5. Check for duplicates in a 4-day window
     const startSearch = new Date(transaction.date);
@@ -141,23 +164,24 @@ app.post('/transaction', async (req, res) => {
       return res.json({ success: true, message: 'Duplicate transaction skipped' });
     }
 
-    // 6. Import the transaction using the reconciliation engine to guarantee transfers link
+    // 6. Import the transaction using the reconciliation engine
     console.log('📥 Injecting transaction via import engine...');
     const importResult = await Actual.importTransactions(accountId, [{
       date: transaction.date,
       payee: transferPayeeId || null, 
-      payee_name: transferPayeeId ? null : transaction.payee,
+      payee_name: (transferPayeeId || isMissingPayee) ? null : transaction.payee,
       amount: transaction.amount,
       account: accountId,
-      cleared: false, // Explicitly keep individual transaction flag false
+      cleared: false, 
       notes: `Sync-ID: ${req.body.messageId}`,
+      imported_id: `${uniqueId}`,
     }], {
-      defaultCleared: false // Override the import engine's default behavior
+      defaultCleared: false 
     });
 
     console.log(`📋 Import engine output: Added ${importResult.added.length}, Updated ${importResult.updated.length}`);
 
-    // 7. Sync updates back to the Unraid instance
+    // 7. Sync updates back to the instance
     console.log('🔄 Syncing changes back to server...');
     await Actual.sync();
     console.log(`✅ Staged and Synced: ${transaction.payee}`);
