@@ -129,15 +129,20 @@ app.post('/transaction', async (req, res) => {
     // Resolve target ledger account UUID
     const accountId = await resolveAccountId(transaction.targetAccount);
 
-    // Duplicate Check Window: Scan recent records to catch network/retry double-posting
+    // Duplicate Check Window: Scan recent records to check if our deterministic target ID already exists
     const startSearch = new Date(transaction.date);
-    startSearch.setDate(startSearch.getDate() - 3);
+    startSearch.setDate(startSearch.getDate() - 4); // Safely cover the ingestion window
     const startDate = startSearch.toISOString().split('T')[0];
     const endDate = new Date().toISOString().split('T')[0];
 
     const accountTxns = await Actual.getTransactions(accountId, startDate, endDate);
-    logger.debug(`Duplicate check scanned window [${startDate} to ${endDate}] and found ${accountTxns.length} recent transactions.`);
-    const alreadyProcessed = accountTxns.some(tx => tx.notes && tx.notes.includes(messageId));
+    
+    // Determine target primary keys for exact duplication validation matching
+    const targetKey = transaction.type === 'internal_transfer' 
+      ? `${messageId}-inflow` 
+      : messageId;
+
+    const alreadyProcessed = accountTxns.some(tx => tx.id === targetKey);
 
     if (alreadyProcessed) {
       logger.info(`Skipping duplicate request tracking Sync-ID: ${messageId}`);
@@ -146,6 +151,7 @@ app.post('/transaction', async (req, res) => {
     }
 
     const transactionsToInsert = [];
+    const automationNote = '🤖 Automated Entry';
 
     // Branching Processing Topology based on execution metadata type
     if (transaction.type === 'internal_transfer') {
@@ -154,9 +160,9 @@ app.post('/transaction', async (req, res) => {
       const sourceAccountId = await resolveAccountId(transaction.payee);
       const destinationAccountId = accountId;
       
-      // 🚨 CRITICAL GUARD: Prevent circular loop transfer failure
+      // CRITICAL GUARD: Prevent circular loop transfer failure
       if (sourceAccountId === destinationAccountId) {
-        throw new Error(`Transfer aborted: Source and Destination accounts both resolved to the same ledger ID (${sourceAccountId}). Verify payload names or default fallbacks.`);
+        throw new Error(`Transfer aborted: Source and Destination accounts both resolved to the same ledger ID (${sourceAccountId}). Verify payload names.`);
       }
 
       logger.debug(`Resolved transfer accounts -> Source UUID: ${sourceAccountId} | Destination UUID: ${destinationAccountId}`);
@@ -171,9 +177,9 @@ app.post('/transaction', async (req, res) => {
 
       logger.debug(`Resolved system transfer payees -> Source Payee ID: ${sourceTransferPayee.id} | Destination Payee ID: ${destinationTransferPayee.id}`);
 
-      // Generate local matching keys to structurally bind the double-entry legs together
-      const idA = crypto.randomUUID();
-      const idB = crypto.randomUUID();
+      // Generate deterministic keys derived directly from the messageId to cleanly bind legs without table collisions
+      const idA = `${messageId}-inflow`;
+      const idB = `${messageId}-outflow`;
 
       // Leg A: Destination Account ledger write layer (Inflow/Positive)
       transactionsToInsert.push({
@@ -184,7 +190,7 @@ app.post('/transaction', async (req, res) => {
         account: destinationAccountId,
         payee: sourceTransferPayee.id,
         cleared: false,
-        notes: `Sync-ID: ${messageId}`
+        notes: automationNote
       });
 
       // Leg B: Source Account ledger write layer (Outflow/Inverted Negative)
@@ -196,7 +202,7 @@ app.post('/transaction', async (req, res) => {
         account: sourceAccountId,
         payee: destinationTransferPayee.id,
         cleared: false,
-        notes: `Sync-ID: ${messageId}`
+        notes: automationNote
       });
 
       logger.debug(`Injecting explicit transfer pairs via addTransactions engine. Payloads:`, JSON.stringify(transactionsToInsert, null, 2));
@@ -208,13 +214,14 @@ app.post('/transaction', async (req, res) => {
       logger.info(`Processing standard transaction record entry for payee: "${transaction.payee}"`);
       
       const standardPayload = {
+        id: messageId, // Anchor the primary key to the immutable messageId
         date: transaction.date,
         amount: transaction.amount,
         account: accountId,
         payee_name: transaction.payee || null,
         payee: null,
         cleared: false,
-        notes: `Sync-ID: ${messageId}`
+        notes: automationNote
       };
 
       logger.debug(`Injecting standard single entry via addTransactions engine. Payload:`, JSON.stringify(standardPayload, null, 2));
