@@ -114,12 +114,16 @@ X-Api-Key: <your_secret_api_key>
 
 ## Docker / Unraid Deployment
 
-### Build Image
+### Option A: Pre-built Image (GitHub Container Registry)
+
+Pull the published container directly from GHCR:
+
 ```bash
-docker build -t actual-budget-ingress:latest .
+docker pull ghcr.io/<your-github-username>/actual-budget-ingress:latest
 ```
 
-### Run Container
+Run the container using the GHCR image:
+
 ```bash
 docker run -d \
   --name actual-budget-ingress \
@@ -131,5 +135,11 @@ docker run -d \
   -e DEFAULT_ACCOUNT="Checking" \
   -v /mnt/user/appdata/actual-ingress:/tmp/actual-api-data \
   --restart unless-stopped \
-  actual-budget-ingress:latest
+  ghcr.io/<your-github-username>/actual-budget-ingress:latest
+```
+
+### Option B: Build Image Locally
+
+```bash
+docker build -t actual-budget-ingress:latest .
 ```
