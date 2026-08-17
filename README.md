@@ -85,7 +85,7 @@ X-Api-Key: <your_secret_api_key>
 ### Installation
 1. Clone the repository:
    ```bash
-   git clone https://github.com/<your-user>/actual-budget-ingress.git
+   git clone https://github.com/jenobi/actual-budget-ingress.git
    cd actual-budget-ingress
    ```
 
@@ -119,7 +119,7 @@ X-Api-Key: <your_secret_api_key>
 Pull the published container directly from GHCR:
 
 ```bash
-docker pull ghcr.io/<your-github-username>/actual-budget-ingress:latest
+docker pull ghcr.io/jenobi/actual-budget-ingress:latest
 ```
 
 Run the container using the GHCR image:
@@ -135,7 +135,7 @@ docker run -d \
   -e DEFAULT_ACCOUNT="Checking" \
   -v /mnt/user/appdata/actual-ingress:/tmp/actual-api-data \
   --restart unless-stopped \
-  ghcr.io/<your-github-username>/actual-budget-ingress:latest
+  ghcr.io/jenobi/actual-budget-ingress:latest
 ```
 
 ### Option B: Build Image Locally
