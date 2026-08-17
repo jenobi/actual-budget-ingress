@@ -1,5 +1,6 @@
 const express = require('express');
 const Actual = require('@actual-app/api');
+const { Mutex } = require('async-mutex');
 const path = require('path');
 const fs = require('fs').promises;
 const crypto = require('crypto');
@@ -24,7 +25,11 @@ process.on('unhandledRejection', (reason, promise) => {
 const app = express();
 app.use(express.json());
 
-// 2. Configuration Parameters via Environment Variables
+// 2. Concurrency & Connection State Tracking
+const mutex = new Mutex();
+let isConnected = false;
+
+// Configuration Parameters via Environment Variables
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.ACTUAL_DATA_DIR || '/tmp/actual-api-data';
 const ACTUAL_SERVER_URL = (process.env.ACTUAL_SERVER_URL || '').trim();
@@ -32,7 +37,7 @@ const ACTUAL_PASSWORD = (process.env.ACTUAL_PASSWORD || '').trim();
 const SYNC_ID = (process.env.ACTUAL_SYNC_ID || '').trim();
 const DEFAULT_ACCOUNT = process.env.DEFAULT_ACCOUNT || '';
 const INGRESS_API_KEY = process.env.INGRESS_API_KEY || '';
-const TRANSACTION_NOTE = process.env.TRANSACTION_NOTE || '🤖 Automated Entry'
+const TRANSACTION_NOTE = process.env.TRANSACTION_NOTE || '🤖 Automated Entry';
 
 if (process.env.NODE_ENV === 'production' && !INGRESS_API_KEY) {
   logger.warn('INGRESS_API_KEY is not set in production environment. The bridge gateway is open!');
@@ -79,7 +84,7 @@ async function resolveAccountId(friendlyName) {
 }
 
 /**
- * Structural setup and sync initialization for the local budget instance
+ * Structural setup and download for the local budget instance
  */
 async function initActual() {
   await fs.mkdir(DATA_DIR, { recursive: true });
@@ -99,6 +104,27 @@ async function initActual() {
     logger.debug(`Loading local cached budget copy: ${existing.id}`);
     await Actual.loadBudget(existing.id);
   }
+}
+
+/**
+ * Ensures a persistent connection to Actual Budget.
+ * Performs a fast sync check if already connected, or re-initializes seamlessly if dropped.
+ */
+async function ensureConnected() {
+  if (isConnected) {
+    try {
+      await Actual.sync();
+      return;
+    } catch (err) {
+      logger.warn('Connection probe failed, re-initializing budget connection...', err.message);
+      isConnected = false;
+    }
+  }
+
+  logger.info('Initializing persistent Actual API connection...');
+  await initActual();
+  isConnected = true;
+  logger.info('Persistent Actual API connection established.');
 }
 
 // 3. Central Ingress Endpoints
@@ -124,124 +150,143 @@ app.post('/transaction', async (req, res) => {
     });
   }
 
-  try {
-    await initActual();
+  // Serialize incoming HTTP requests to execute sequentially through the Mutex lock
+  return mutex.runExclusive(async () => {
+    try {
+      await ensureConnected();
 
-    // Resolve target ledger account UUID
-    const accountId = await resolveAccountId(transaction.targetAccount);
+      // Resolve target ledger account UUID
+      const accountId = await resolveAccountId(transaction.targetAccount);
 
-    // Duplicate Check Window: Scan recent records to check if our deterministic target ID already exists
-    const startSearch = new Date(transaction.date);
-    startSearch.setDate(startSearch.getDate() - 4); // Safely cover the ingestion window
-    const startDate = startSearch.toISOString().split('T')[0];
-    const endDate = new Date().toISOString().split('T')[0];
+      // Duplicate Check Window: Scan recent records to check if our deterministic target ID already exists
+      const startSearch = new Date(transaction.date);
+      startSearch.setDate(startSearch.getDate() - 4); // Safely cover the ingestion window
+      const startDate = startSearch.toISOString().split('T')[0];
+      const endDate = new Date().toISOString().split('T')[0];
 
-    const accountTxns = await Actual.getTransactions(accountId, startDate, endDate);
-    
-    // Determine target primary keys for exact duplication validation matching
-    const targetKey = transaction.type === 'internal_transfer' 
-      ? `${messageId}-inflow` 
-      : messageId;
-
-    const alreadyProcessed = accountTxns.some(tx => tx.id === targetKey);
-
-    if (alreadyProcessed) {
-      logger.info(`Skipping duplicate request tracking Sync-ID: ${messageId}`);
-      await Actual.shutdown();
-      return res.json({ success: true, message: 'Duplicate transaction injection skipped' });
-    }
-
-    const transactionsToInsert = [];
-    const automationNote = TRANSACTION_NOTE;
-
-    // Branching Processing Topology based on execution metadata type
-    if (transaction.type === 'internal_transfer') {
-      logger.info(`Processing linked double-entry transfer from "${transaction.payee}" to "${transaction.targetAccount}"`);
+      const accountTxns = await Actual.getTransactions(accountId, startDate, endDate);
       
-      const sourceAccountId = await resolveAccountId(transaction.payee);
-      const destinationAccountId = accountId;
-      
-      // CRITICAL GUARD: Prevent circular loop transfer failure
-      if (sourceAccountId === destinationAccountId) {
-        throw new Error(`Transfer aborted: Source and Destination accounts both resolved to the same ledger ID (${sourceAccountId}). Verify payload names.`);
+      // Determine target primary keys for exact duplication validation matching
+      const targetKey = transaction.type === 'internal_transfer' 
+        ? `${messageId}-inflow` 
+        : messageId;
+
+      const alreadyProcessed = accountTxns.some(tx => tx.id === targetKey);
+
+      if (alreadyProcessed) {
+        logger.info(`Skipping duplicate request tracking Sync-ID: ${messageId}`);
+        return res.json({ success: true, message: 'Duplicate transaction injection skipped' });
       }
 
-      logger.debug(`Resolved transfer accounts -> Source UUID: ${sourceAccountId} | Destination UUID: ${destinationAccountId}`);
-      
-      const payeesList = await Actual.getPayees();
-      const sourceTransferPayee = payeesList.find(p => p.transfer_acct === sourceAccountId);
-      const destinationTransferPayee = payeesList.find(p => p.transfer_acct === destinationAccountId);
+      const transactionsToInsert = [];
+      const automationNote = TRANSACTION_NOTE;
 
-      if (!sourceTransferPayee || !destinationTransferPayee) {
-        throw new Error('Failed structural integrity check: Missing corresponding system-managed transfer payees.');
+      // Branching Processing Topology based on execution metadata type
+      if (transaction.type === 'internal_transfer') {
+        logger.info(`Processing linked double-entry transfer from "${transaction.payee}" to "${transaction.targetAccount}"`);
+        
+        const sourceAccountId = await resolveAccountId(transaction.payee);
+        const destinationAccountId = accountId;
+        
+        // CRITICAL GUARD: Prevent circular loop transfer failure
+        if (sourceAccountId === destinationAccountId) {
+          throw new Error(`Transfer aborted: Source and Destination accounts both resolved to the same ledger ID (${sourceAccountId}). Verify payload names.`);
+        }
+
+        logger.debug(`Resolved transfer accounts -> Source UUID: ${sourceAccountId} | Destination UUID: ${destinationAccountId}`);
+        
+        const payeesList = await Actual.getPayees();
+        const sourceTransferPayee = payeesList.find(p => p.transfer_acct === sourceAccountId);
+        const destinationTransferPayee = payeesList.find(p => p.transfer_acct === destinationAccountId);
+
+        if (!sourceTransferPayee || !destinationTransferPayee) {
+          throw new Error('Failed structural integrity check: Missing corresponding system-managed transfer payees.');
+        }
+
+        logger.debug(`Resolved system transfer payees -> Source Payee ID: ${sourceTransferPayee.id} | Destination Payee ID: ${destinationTransferPayee.id}`);
+
+        // Generate deterministic keys derived directly from the messageId to cleanly bind legs without table collisions
+        const idA = `${messageId}-inflow`;
+        const idB = `${messageId}-outflow`;
+
+        // Leg A: Destination Account ledger write layer (Inflow/Positive)
+        transactionsToInsert.push({
+          id: idA,
+          transfer_id: idB,
+          date: transaction.date,
+          amount: transaction.amount,
+          account: destinationAccountId,
+          payee: sourceTransferPayee.id,
+          cleared: false,
+          notes: automationNote
+        });
+
+        // Leg B: Source Account ledger write layer (Outflow/Inverted Negative)
+        transactionsToInsert.push({
+          id: idB,
+          transfer_id: idA,
+          date: transaction.date,
+          amount: -transaction.amount,
+          account: sourceAccountId,
+          payee: destinationTransferPayee.id,
+          cleared: false,
+          notes: automationNote
+        });
+
+        logger.debug(`Injecting explicit transfer pairs via addTransactions engine. Payloads:`, JSON.stringify(transactionsToInsert, null, 2));
+        const [legA, legB] = transactionsToInsert;
+        await Actual.addTransactions(legA.account, [legA]);
+        await Actual.addTransactions(legB.account, [legB]);
+
+      } else {
+        logger.info(`Processing standard transaction record entry for payee: "${transaction.payee}"`);
+        
+        const standardPayload = {
+          id: messageId, // Anchor the primary key to the immutable messageId
+          date: transaction.date,
+          amount: transaction.amount,
+          account: accountId,
+          payee_name: transaction.payee || null,
+          payee: null,
+          cleared: false,
+          notes: automationNote
+        };
+
+        logger.debug(`Injecting standard single entry via addTransactions engine. Payload:`, JSON.stringify(standardPayload, null, 2));
+        await Actual.addTransactions(accountId, [standardPayload]);
       }
 
-      logger.debug(`Resolved system transfer payees -> Source Payee ID: ${sourceTransferPayee.id} | Destination Payee ID: ${destinationTransferPayee.id}`);
+      logger.debug('Synchronizing data delta changes to remote instance...');
+      await Actual.sync();
+      logger.info(`Successfully staged and synchronized transaction metrics.`);
 
-      // Generate deterministic keys derived directly from the messageId to cleanly bind legs without table collisions
-      const idA = `${messageId}-inflow`;
-      const idB = `${messageId}-outflow`;
+      return res.json({ success: true, message: 'Transaction datasets processed and synced safely' });
 
-      // Leg A: Destination Account ledger write layer (Inflow/Positive)
-      transactionsToInsert.push({
-        id: idA,
-        transfer_id: idB,
-        date: transaction.date,
-        amount: transaction.amount,
-        account: destinationAccountId,
-        payee: sourceTransferPayee.id,
-        cleared: false,
-        notes: automationNote
-      });
-
-      // Leg B: Source Account ledger write layer (Outflow/Inverted Negative)
-      transactionsToInsert.push({
-        id: idB,
-        transfer_id: idA,
-        date: transaction.date,
-        amount: -transaction.amount,
-        account: sourceAccountId,
-        payee: destinationTransferPayee.id,
-        cleared: false,
-        notes: automationNote
-      });
-
-      logger.debug(`Injecting explicit transfer pairs via addTransactions engine. Payloads:`, JSON.stringify(transactionsToInsert, null, 2));
-      const [legA, legB] = transactionsToInsert;
-      await Actual.addTransactions(legA.account, [legA]);
-      await Actual.addTransactions(legB.account, [legB]);
-
-    } else {
-      logger.info(`Processing standard transaction record entry for payee: "${transaction.payee}"`);
-      
-      const standardPayload = {
-        id: messageId, // Anchor the primary key to the immutable messageId
-        date: transaction.date,
-        amount: transaction.amount,
-        account: accountId,
-        payee_name: transaction.payee || null,
-        payee: null,
-        cleared: false,
-        notes: automationNote
-      };
-
-      logger.debug(`Injecting standard single entry via addTransactions engine. Payload:`, JSON.stringify(standardPayload, null, 2));
-      await Actual.addTransactions(accountId, [standardPayload]);
+    } catch (error) {
+      logger.error('Failure intercepted inside endpoint execution runtime:', error);
+      // Reset connection state flag if a fatal error occurs during write operations
+      isConnected = false;
+      return res.status(500).json({ error: error.message });
     }
-
-    logger.debug('Synchronizing data delta changes to remote instance...');
-    await Actual.sync();
-    logger.info(`Successfully staged and synchronized transaction metrics.`);
-
-    await Actual.shutdown();
-    return res.json({ success: true, message: 'Transaction datasets processed and synced safely' });
-
-  } catch (error) {
-    logger.error('Failure intercepted inside endpoint execution runtime:', error);
-    try { await Actual.shutdown(); } catch (_) {}
-    return res.status(500).json({ error: error.message });
-  }
+  });
 });
+
+// 4. Graceful Container Shutdown Process Handling
+async function gracefulShutdown(signal) {
+  logger.info(`Received ${signal}. Closing persistent Actual Budget session...`);
+  try {
+    if (isConnected) {
+      await Actual.shutdown();
+      isConnected = false;
+    }
+  } catch (err) {
+    logger.error('Error during shutdown:', err.message);
+  }
+  process.exit(0);
+}
+
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 app.listen(PORT, () => {
   logger.info(`Active configured logging filtering threshold: ${LOG_LEVEL}`);
