@@ -7,7 +7,7 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@actual-app/api": "^26.7.0",
+    "@actual-app/api": "^26.9.0",
     "async-mutex": "^0.5.0",
     "express": "^4.19.0"
   },
