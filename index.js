@@ -2,8 +2,13 @@ const express = require('express');
 const Actual = require('@actual-app/api');
 const { Mutex } = require('async-mutex');
 const path = require('path');
-const fs = require('fs').promises;
+const fs = require('fs');
 const crypto = require('crypto');
+
+// Load .env locally if present; skip silently in Docker where env vars are natively injected
+if (fs.existsSync(path.join(__dirname, '.env'))) {
+  require('dotenv').config();
+}
 
 // 1. Hierarchical Logger Setup
 const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
@@ -87,7 +92,7 @@ async function resolveAccountId(friendlyName) {
  * Structural setup and download for the local budget instance
  */
 async function initActual() {
-  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.promises.mkdir(DATA_DIR, { recursive: true });
   await Actual.init({
     dataDir: DATA_DIR,
     serverURL: ACTUAL_SERVER_URL,
@@ -95,14 +100,21 @@ async function initActual() {
   });
 
   const budgets = await Actual.getBudgets();
-  const existing = budgets.find(b => b.id === SYNC_ID);
+  const existing = budgets.find(b => b.groupId === SYNC_ID || b.cloudFileId === SYNC_ID);
 
   if (!existing) {
-    logger.info('Budget file not found locally. Downloading from server...');
+    throw new Error(`Budget with ID ${SYNC_ID} not found on the remote server.`);
+  }
+
+  try {
+    logger.info(`Attempting to load local cached budget: ${existing.name}`);
+    await Actual.loadBudget(SYNC_ID);
+    logger.info('Local budget loaded successfully.');
+  } catch (err) {
+    logger.info('Local budget files not found. Downloading from server...');
+    // downloadBudget automatically downloads and loads the budget into the active session
     await Actual.downloadBudget(SYNC_ID);
-  } else {
-    logger.debug(`Loading local cached budget copy: ${existing.id}`);
-    await Actual.loadBudget(existing.id);
+    logger.info('Budget downloaded and loaded successfully.');
   }
 }
 
