@@ -3,10 +3,10 @@ name: Build and Push to GHCR
 on:
   push:
     branches: [ "main" ]
+    tags: [ 'v*.*.*' ] # Triggers automatically when you push a Git tag like v1.0.0
 
 env:
   REGISTRY: ghcr.io
-  # github.repository format is 'owner/repo-name' (e.g., jenzzee/actual-budget-ingress)
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -20,11 +20,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Set up Buildx so we can use Docker features like build caching
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Log in to GitHub Container Registry using the automatic GITHUB_TOKEN
       - name: Log into registry ${{ env.REGISTRY }}
         uses: docker/login-action@v3
         with:
@@ -32,12 +30,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the image and push it as 'latest'
+      # Automatically generate Docker tags based on branch or git tag
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # If pushing to main, tag as 'latest'
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # If pushing a git tag (e.g. v1.0.0), extract semantic tags like v1.0.0 and 1.0.0
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
