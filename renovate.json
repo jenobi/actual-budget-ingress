@@ -2,5 +2,26 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
     "config:recommended"
+  ],
+  "packageRules": [
+    {
+      "description": "Group all GitHub Actions updates together",
+      "matchManagers": ["github-actions"],
+      "groupName": "GitHub Actions",
+      "groupSlug": "github-actions"
+    },
+    {
+      "description": "Group all Docker / Base Image updates together",
+      "matchManagers": ["dockerfile"],
+      "groupName": "Docker Base Images",
+      "groupSlug": "docker-images"
+    },
+    {
+      "description": "Group safe non-major npm updates together",
+      "matchManagers": ["npm"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "npm non-major dependencies",
+      "groupSlug": "npm-non-major"
+    }
   ]
 }
