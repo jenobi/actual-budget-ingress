@@ -1,5 +1,5 @@
 # --- Build Stage ---
-FROM node:22-alpine AS builder
+FROM node:26-alpine AS builder
 WORKDIR /app
 
 # Install build dependencies required if any native modules need compilation
@@ -9,7 +9,7 @@ COPY package*.json ./
 RUN npm ci --only=production
 
 # --- Runtime Stage ---
-FROM node:22-alpine
+FROM node:26-alpine
 WORKDIR /app
 
 ENV NODE_ENV=production
