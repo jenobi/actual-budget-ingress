@@ -1,13 +1,13 @@
 {
   "name": "actual-budget-ingress",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Bridge between n8n webhooks and Actual Budget API",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "@actual-app/api": "^26.10.0",
+    "@actual-app/api": "^26.11.0",
     "async-mutex": "^0.5.0",
     "express": "^5.3.0"
   },
