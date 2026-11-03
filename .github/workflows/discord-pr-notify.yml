@@ -1,0 +1,23 @@
+name: Discord PR Notification
+
+on:
+  pull_request:
+    types: [opened]
+  workflow_dispatch:
+
+jobs:
+  notify-discord:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord Notification
+        uses: sarisia/actions-status-discord@v1
+        if: github.event.pull_request.user.login != 'jenobi'
+        with:
+          webhook: ${{ secrets.DISCORD_WEBHOOK }}
+          title: "🚀 New Pull Request Raised"
+          description: |
+            **Repository:** ${{ github.repository }}
+            **PR:** [${{ github.event.pull_request.title }}](${{ github.event.pull_request.html_url }})
+            **Author:** ${{ github.event.pull_request.user.login }}
+          color: 0x5865F2
+          image: ${{ github.event.pull_request.user.avatar_url }}
