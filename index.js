@@ -139,6 +139,15 @@ async function ensureConnected() {
   logger.info('Persistent Actual API connection established.');
 }
 
+// Health Check Endpoint for Docker 
+app.get('/health', (req, res) => {
+    res.status(200).json({ 
+        status: "UP", 
+        timestamp: new Date().toISOString() 
+    });
+});
+
+
 // 3. Central Ingress Endpoints
 app.post('/transaction', async (req, res) => {
 
